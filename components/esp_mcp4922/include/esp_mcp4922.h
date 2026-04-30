@@ -27,8 +27,9 @@ typedef struct {
  * @brief MCP4922 context structure
  */
 typedef struct {
-    spi_device_handle_t *spi_handles; /*!< Array of SPI device handles, one for each chip */
+    spi_device_handle_t spi_handle;   /*!< Single SPI device handle used for all chips */
     int num_chips;                    /*!< Number of chips initialized */
+    gpio_num_t *cs_pins;              /*!< Array of CS GPIO pins, stored for fast software toggling */
     int ldac_io_num;                  /*!< LDAC GPIO pin, stored for pulsing */
     uint16_t config_bits_a;           /*!< Pre-computed config bits for channel A */
     uint16_t config_bits_b;           /*!< Pre-computed config bits for channel B */
@@ -44,7 +45,12 @@ typedef struct {
 esp_err_t mcp4922_init(const mcp4922_config_t *config, mcp4922_context_t *ctx);
 
 /**
- * @brief Write values to all channels (Normal Task context)
+ * @brief Write values to all channels (Standard/Safe context)
+ * 
+ * @note This function uses the standard ESP-IDF SPI driver. It is thread-safe and 
+ *       respects FreeRTOS mutexes. Use this function when the SPI bus is SHARED 
+ *       with other peripherals (like SD cards or Displays) or for initialization.
+ *       It has higher latency due to the driver's overhead.
  * 
  * @param ctx Pointer to the context structure
  * @param channel_values Array of values to write. Length should be ctx->num_chips * 2. 
@@ -54,16 +60,20 @@ esp_err_t mcp4922_init(const mcp4922_config_t *config, mcp4922_context_t *ctx);
 esp_err_t mcp4922_write_channels(mcp4922_context_t *ctx, uint16_t *channel_values);
 
 /**
- * @brief Write values to all channels (ISR context)
+ * @brief Write values to all channels (Low-Level/Bare-Metal context)
  * 
- * @note This function is placed in IRAM and uses polling for minimum latency.
- *       It must ONLY be called from hardware interrupts.
+ * @note This function bypasses the ESP-IDF drivers and writes directly to the 
+ *       SPI hardware registers for ultra-low latency (few microseconds).
+ *       WARNING: It is NOT thread-safe! The caller MUST ensure exclusive access 
+ *       to the SPI bus (e.g., by calling spi_device_acquire_bus() beforehand) 
+ *       if the bus is shared with other peripherals.
+ *       It can be called from both normal Tasks or ISRs (Hardware Interrupts).
  * 
  * @param ctx Pointer to the context structure
  * @param channel_values Array of values to write. Length should be ctx->num_chips * 2. 
  *                       Values should be 12-bit (0-4095).
  */
-void mcp4922_write_channels_isr(mcp4922_context_t *ctx, uint16_t *channel_values);
+void mcp4922_ll_write_channels(mcp4922_context_t *ctx, uint16_t *channel_values);
 
 #ifdef __cplusplus
 }

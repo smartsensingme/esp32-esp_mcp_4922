@@ -14,40 +14,51 @@ static const char *TAG = "main";
 // The LUT for 60Hz sine at 13.5kHz sampling rate. Placed in RAM.
 DRAM_ATTR static uint16_t sine_lut[SINE_POINTS];
 
-// Indices for phase shifting
+// Indices for phase shifting (3-phase network)
 #define PHASE_0_OFFSET   0
-#define PHASE_90_OFFSET  56
-#define PHASE_180_OFFSET 112
+#define PHASE_120_OFFSET 75   // 120 degrees = 1/3 of 225 points
+#define PHASE_240_OFFSET 150  // 240 degrees = 2/3 of 225 points
 
 static mcp4922_context_t dac_ctx;
 static int lut_idx = 0;
 
+static TaskHandle_t dac_task_handle = NULL;
+
+/* 
+ * ============================================================================
+ * CRITICAL ARCHITECTURE WARNING (ISR vs FPU)
+ * ============================================================================
+ * Do NOT perform floating-point calculations (float/double) inside this ISR!
+ * 
+ * On the ESP32 (Xtensa architecture), the C compiler (GCC) automatically 
+ * translates ANY `float` operation into hardware FPU instructions (e.g., mul.s).
+ * To minimize interrupt latency, the ESP-IDF FreeRTOS port DOES NOT save the 
+ * FPU register states (f0-f15) when entering an ISR.
+ * 
+ * If this ISR interrupts a Task that was in the middle of a floating-point 
+ * calculation, and you do a `float` operation here, the FPU registers will be 
+ * overwritten ("dirtied"). When the ISR returns, the original Task will read 
+ * corrupted math data, leading to catastrophic and hard-to-debug system crashes.
+ * 
+ * GOLDEN RULE: The ISR must only clear flags and wake up a High-Priority Task 
+ * (Deferred Interrupt Pattern). All PI/PID control loops and heavy math MUST 
+ * be executed inside `dac_writer_task`.
+ * ============================================================================
+ */
 static bool IRAM_ATTR timer_isr_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data) {
-    uint16_t val[4];
-    
-    val[0] = sine_lut[lut_idx]; // 0 degrees
-    val[1] = sine_lut[(lut_idx + PHASE_90_OFFSET) % SINE_POINTS]; // 90 degrees
-    val[2] = sine_lut[(lut_idx + PHASE_180_OFFSET) % SINE_POINTS]; // 180 degrees
-    val[3] = 0; // Unused channel
-    
-    mcp4922_write_channels_isr(&dac_ctx, val);
-    
-    lut_idx++;
-    if (lut_idx >= SINE_POINTS) {
-        lut_idx = 0;
-    }
-    
-    return false; // Don't yield
+    BaseType_t high_task_awoken = pdFALSE;
+    vTaskNotifyGiveFromISR(dac_task_handle, &high_task_awoken);
+    return (high_task_awoken == pdTRUE);
 }
 
-static void gptimer_init_task(void *arg) {
+static void dac_writer_task(void *arg) {
     ESP_LOGI(TAG, "Initializing GPTimer on Core %d", xPortGetCoreID());
 
     gptimer_handle_t gptimer = NULL;
     gptimer_config_t timer_config = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 40000000, // 40MHz para altíssima precisão
+        .resolution_hz = 40000000, // 40MHz
     };
     
     ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
@@ -67,10 +78,34 @@ static void gptimer_init_task(void *arg) {
     ESP_ERROR_CHECK(gptimer_enable(gptimer));
     ESP_ERROR_CHECK(gptimer_start(gptimer));
 
-    ESP_LOGI(TAG, "GPTimer started at 13.5kHz");
+    ESP_LOGI(TAG, "GPTimer started at 13.5kHz. Entering DAC write loop.");
     
-    // Once configured, the task can be deleted. The timer ISR will remain on this core.
-    vTaskDelete(NULL);
+    // Acquire the SPI bus permanently for this task.
+    // This removes the overhead of acquiring the FreeRTOS mutex on every single transmission.
+    spi_device_acquire_bus(dac_ctx.spi_handle, portMAX_DELAY);
+    
+    uint16_t val[4] = {0, 0, 0, 0};
+    
+    // Send a dummy transaction using the high-level API to properly configure the SPI hardware
+    // registers (clock speed, mode, bit length = 16) inside the ESP32.
+    mcp4922_write_channels(&dac_ctx, val);
+    
+    while (1) {
+        // Wait for notification from ISR
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        
+        val[0] = sine_lut[lut_idx]; // Fase R (0 graus)
+        val[1] = sine_lut[(lut_idx + PHASE_120_OFFSET) % SINE_POINTS]; // Fase S (120 graus)
+        val[2] = sine_lut[(lut_idx + PHASE_240_OFFSET) % SINE_POINTS]; // Fase T (240 graus)
+        val[3] = 0; // Unused channel
+        
+        mcp4922_ll_write_channels(&dac_ctx, val);
+        
+        lut_idx++;
+        if (lut_idx >= SINE_POINTS) {
+            lut_idx = 0;
+        }
+    }
 }
 
 void app_main(void) {
@@ -106,7 +141,7 @@ void app_main(void) {
         return;
     }
 
-    // Create a task pinned to Core 1 to initialize the GPTimer.
-    // This ensures that the GPTimer ISR runs on Core 1, away from Wi-Fi/BT on Core 0.
-    xTaskCreatePinnedToCore(gptimer_init_task, "gptimer_init", 4096, NULL, 5, NULL, 1);
+    // Create a high-priority task pinned to Core 1 to handle SPI transmissions.
+    // This ensures that the GPTimer ISR runs on Core 1, and the SPI task is immediately awoken.
+    xTaskCreatePinnedToCore(dac_writer_task, "dac_writer", 4096, NULL, configMAX_PRIORITIES - 1, &dac_task_handle, 1);
 }

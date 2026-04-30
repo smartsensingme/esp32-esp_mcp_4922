@@ -6,6 +6,7 @@
 #include "hal/gpio_hal.h"
 #include "rom/ets_sys.h"
 #include <string.h>
+#include "soc/spi_struct.h"
 
 static const char *TAG = "MCP4922";
 
@@ -35,15 +36,16 @@ esp_err_t mcp4922_init(const mcp4922_config_t *config, mcp4922_context_t *ctx) {
     // We only initialize the bus if it's not already initialized.
     // In ESP-IDF, if you call spi_bus_initialize on an already init'd bus, it returns ESP_ERR_INVALID_STATE.
     // We'll try to init, and ignore INVALID_STATE.
-    esp_err_t ret = spi_bus_initialize(config->host_id, &buscfg, SPI_DMA_CH_AUTO);
+    // Use SPI_DMA_DISABLED (0) because all our transactions are 16-bits and DMA setup overhead is too high.
+    esp_err_t ret = spi_bus_initialize(config->host_id, &buscfg, 0); // 0 = SPI_DMA_DISABLED
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    // Allocate array for SPI handles
-    ctx->spi_handles = malloc(config->num_chips * sizeof(spi_device_handle_t));
-    ESP_RETURN_ON_FALSE(ctx->spi_handles != NULL, ESP_ERR_NO_MEM, TAG, "Failed to allocate memory for SPI handles");
+    // Allocate memory for CS pins
+    ctx->cs_pins = malloc(config->num_chips * sizeof(gpio_num_t));
+    ESP_RETURN_ON_FALSE(ctx->cs_pins != NULL, ESP_ERR_NO_MEM, TAG, "Failed to allocate memory for CS pins");
     ctx->num_chips = config->num_chips;
     ctx->ldac_io_num = config->ldac_io_num;
 
@@ -61,25 +63,34 @@ esp_err_t mcp4922_init(const mcp4922_config_t *config, mcp4922_context_t *ctx) {
     ctx->config_bits_a = base_config | MCP4922_DAC_A_BIT;
     ctx->config_bits_b = base_config | MCP4922_DAC_B_BIT;
 
-    // Add devices
+    // Add a single SPI device with software CS
     spi_device_interface_config_t devcfg = {
         .clock_speed_hz = 20 * 1000 * 1000, // 20 MHz max as per MCP4922 datasheet
         .mode = 0,                          // SPI mode 0 (CPOL=0, CPHA=0)
-        .spics_io_num = -1,                 // We will set this in the loop
+        .spics_io_num = -1,                 // Manual CS control for much lower overhead
         .queue_size = 2,
         .flags = SPI_DEVICE_HALFDUPLEX,
     };
 
+    ret = spi_bus_add_device(config->host_id, &devcfg, &ctx->spi_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add SPI device: %s", esp_err_to_name(ret));
+        free(ctx->cs_pins);
+        return ret;
+    }
+
+    // Configure CS pins
     for (int i = 0; i < config->num_chips; i++) {
-        devcfg.spics_io_num = config->cs_pins[i];
-        ret = spi_bus_add_device(config->host_id, &devcfg, &ctx->spi_handles[i]);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to add SPI device for CS %d: %s", config->cs_pins[i], esp_err_to_name(ret));
-            // Cleanup on failure
-            for(int j=0; j<i; j++) spi_bus_remove_device(ctx->spi_handles[j]);
-            free(ctx->spi_handles);
-            return ret;
-        }
+        ctx->cs_pins[i] = config->cs_pins[i];
+        gpio_config_t io_conf = {
+            .intr_type = GPIO_INTR_DISABLE,
+            .mode = GPIO_MODE_OUTPUT,
+            .pin_bit_mask = (1ULL << config->cs_pins[i]),
+            .pull_down_en = 0,
+            .pull_up_en = 0
+        };
+        gpio_config(&io_conf);
+        gpio_set_level(config->cs_pins[i], 1); // CS is active low, keep high by default
     }
 
     // Configure LDAC pin
@@ -108,26 +119,30 @@ esp_err_t mcp4922_write_channels(mcp4922_context_t *ctx, uint16_t *channel_value
         uint16_t data_a = ctx->config_bits_a | val_a;
         uint16_t data_b = ctx->config_bits_b | val_b;
 
-        // Swap bytes because SPI transmits MSB first, and our ESP is Little Endian
-        data_a = __builtin_bswap16(data_a);
-        data_b = __builtin_bswap16(data_b);
-
         spi_transaction_t t_a = {
+            .flags = SPI_TRANS_USE_TXDATA,
             .length = 16,
-            .tx_buffer = &data_a
         };
+        t_a.tx_data[0] = (data_a >> 8) & 0xFF;
+        t_a.tx_data[1] = data_a & 0xFF;
         
         spi_transaction_t t_b = {
+            .flags = SPI_TRANS_USE_TXDATA,
             .length = 16,
-            .tx_buffer = &data_b
         };
+        t_b.tx_data[0] = (data_b >> 8) & 0xFF;
+        t_b.tx_data[1] = data_b & 0xFF;
 
         // Transmit Channel A
-        esp_err_t ret = spi_device_transmit(ctx->spi_handles[i], &t_a);
+        gpio_set_level(ctx->cs_pins[i], 0);
+        esp_err_t ret = spi_device_transmit(ctx->spi_handle, &t_a);
+        gpio_set_level(ctx->cs_pins[i], 1);
         if (ret != ESP_OK) return ret;
 
         // Transmit Channel B
-        ret = spi_device_transmit(ctx->spi_handles[i], &t_b);
+        gpio_set_level(ctx->cs_pins[i], 0);
+        ret = spi_device_transmit(ctx->spi_handle, &t_b);
+        gpio_set_level(ctx->cs_pins[i], 1);
         if (ret != ESP_OK) return ret;
     }
 
@@ -141,8 +156,16 @@ esp_err_t mcp4922_write_channels(mcp4922_context_t *ctx, uint16_t *channel_value
     return ESP_OK;
 }
 
-void IRAM_ATTR mcp4922_write_channels_isr(mcp4922_context_t *ctx, uint16_t *channel_values) {
-    // Note: No validity checks here to maximize speed in ISR.
+void IRAM_ATTR mcp4922_ll_write_channels(mcp4922_context_t *ctx, uint16_t *channel_values) {
+    // Ultra-fast bare-metal SPI transmission.
+    // Select the correct hardware register struct based on the compiled target CPU.
+#if CONFIG_IDF_TARGET_ESP32
+    // For the classic ESP32
+    spi_dev_t *hw = &SPI2;
+#else
+    // For modern chips: ESP32-S2, S3, C3, C6, P4, etc.
+    spi_dev_t *hw = &GPSPI2;
+#endif
 
     for (int i = 0; i < ctx->num_chips; i++) {
         uint16_t val_a = channel_values[i * 2] & 0x0FFF;
@@ -151,29 +174,32 @@ void IRAM_ATTR mcp4922_write_channels_isr(mcp4922_context_t *ctx, uint16_t *chan
         uint16_t data_a = ctx->config_bits_a | val_a;
         uint16_t data_b = ctx->config_bits_b | val_b;
 
-        data_a = __builtin_bswap16(data_a);
-        data_b = __builtin_bswap16(data_b);
+        // ESP32 SPI transmits from data_buf[0] starting from byte 0.
+        // We need MSByte to go out first, so we swap the bytes.
+        uint32_t word_a = __builtin_bswap16(data_a);
+        uint32_t word_b = __builtin_bswap16(data_b);
 
-        spi_transaction_t t_a = {
-            .length = 16,
-            .tx_buffer = &data_a
-        };
+        // Transmit Channel A
+        gpio_ll_set_level(&GPIO, ctx->cs_pins[i], 0);
+        hw->data_buf[0] = word_a;
+        hw->cmd.usr = 1;
+        while (hw->cmd.usr); // wait for hardware transfer
+        gpio_ll_set_level(&GPIO, ctx->cs_pins[i], 1);
         
-        spi_transaction_t t_b = {
-            .length = 16,
-            .tx_buffer = &data_b
-        };
+        // Satisfy CS high time between commands (15ns min for MCP4922)
+        for(int n=0; n<5; n++) asm volatile("nop");
 
-        // Use polling transmit for ISR context
-        spi_device_polling_transmit(ctx->spi_handles[i], &t_a);
-        spi_device_polling_transmit(ctx->spi_handles[i], &t_b);
+        // Transmit Channel B
+        gpio_ll_set_level(&GPIO, ctx->cs_pins[i], 0);
+        hw->data_buf[0] = word_b;
+        hw->cmd.usr = 1;
+        while (hw->cmd.usr); // wait for hardware transfer
+        gpio_ll_set_level(&GPIO, ctx->cs_pins[i], 1);
     }
 
     // Latch data (LDAC pulse)
     if (ctx->ldac_io_num >= 0) {
-        // Fast GPIO clear/set using HAL
         gpio_ll_set_level(&GPIO, ctx->ldac_io_num, 0);
-        // Usually, few NOPs are enough for 100ns at 240MHz (1 cycle = ~4ns. 25 cycles = 100ns)
         for(int n=0; n<10; n++) asm volatile("nop");
         gpio_ll_set_level(&GPIO, ctx->ldac_io_num, 1);
     }
