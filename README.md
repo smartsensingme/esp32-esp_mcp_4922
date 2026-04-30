@@ -1,77 +1,97 @@
-# Especificação de Projeto: Componente ESP-IDF `esp_mcp4922` e Exemplo Gerador de Senoides
+# ESP-MCP4922 High-Performance DAC Component
 
-## 1. Visão Geral
-Atue como um desenvolvedor Sênior de Sistemas Embarcados especialista em ESP-IDF (v5.x). Seu objetivo é escrever um componente genérico e robusto para o DAC MCP4922 (via SPI) e um projeto de exemplo para o microcontrolador **ESP32-S3**.
+*Read this in other languages: [Português](README.pt-br.md)*
 
-O projeto deve seguir estritamente a estrutura de diretórios do ESP-IDF:
-- `components/esp_mcp4922/` (com `CMakeLists.txt`, `.c`, `.h`)
-- `main/` (com `CMakeLists.txt`, `main.c`)
+An ultra-low latency, bare-metal optimized ESP-IDF component for the **Microchip MCP4922** 12-bit Dual DAC. 
+
+This component is specifically engineered for **hard real-time digital control loops** (such as high-frequency PI/PID controllers for power electronics or inverters), where standard RTOS and SPI driver overheads are unacceptable.
+
+## Features
+
+- **Dual-Mode Operation**:
+  - **Standard Mode (`mcp4922_write_channels`)**: Thread-safe, standard ESP-IDF driver implementation. Ideal when the SPI bus is shared with other peripherals (like SD cards or TFT displays).
+  - **Bare-Metal Mode (`mcp4922_ll_write_channels`)**: Bypasses the ESP-IDF abstraction layer and writes directly to the physical SPI hardware FIFO (`GPSPI2.data_buf`). Eliminates FreeRTOS locks and context checks, reducing transmission latency from >100us to **~3us**.
+- **Multi-Chip Support**: Easily control multiple MCP4922 chips on the same SPI bus with software CS multiplexing.
+- **Cross-Platform**: The Bare-Metal implementation uses preprocessor macros to seamlessly support the classic ESP32, as well as modern chips (ESP32-S2, S3, C3, C6, and ESP32-P4).
+
+## Project Structure
+
+This project is structured as an ESP-IDF component with an included usage example:
+
+* `components/esp_mcp4922/`: The core driver component. Contains the high-level and low-level implementations.
+* `main/main.c`: A complete usage example. It configures the DAC and utilizes the ESP-IDF `gptimer` to generate a perfect **3-phase 60Hz sine wave (120° offset)** at a 13.5kHz sampling rate.
+
+## Example Usage: 3-Phase Sine Wave Generator
+
+The example provided in `main.c` demonstrates the "Deferred Interrupt Processing" RTOS pattern. It uses a high-frequency (13.5kHz) hardware timer to wake up a maximum-priority FreeRTOS task. This ensures deterministic timing while keeping the ISR clean, preventing FPU context corruption that would occur if floating-point math were used inside the ISR itself.
+
+### Hardware Setup
+
+By default, the component uses the following pins (configurable via ESP-IDF `menuconfig`):
+
+* **MOSI**: GPIO 11
+* **SCK**: GPIO 12
+* **LDAC**: GPIO 14
+* **CS1** (Chip 1): GPIO 10
+* **CS2** (Chip 2): GPIO 9
+
+*Note: The hardware CS pin of the SPI peripheral is intentionally disabled (`spics_io_num = -1`). The component manually drives the CS pins using fast `gpio_ll` commands to eliminate the massive driver overhead caused by rapid device switching.*
+
+### How to Build and Run
+
+1. Make sure your ESP-IDF environment is active (`. export.sh`).
+2. Build the project:
+   ```bash
+   idf.py build
+   ```
+3. Flash and monitor:
+   ```bash
+   idf.py -p /dev/ttyUSB0 flash monitor
+   ```
+
+## Design Philosophy & Architecture
+
+For a digital control loop running at 13.5kHz, the execution window is exactly **74 microseconds**. Standard SPI transactions with FreeRTOS mutexes take around 25us per call. Updating 4 channels (2 chips) would take >100us, starving the Idle Task and triggering the FreeRTOS Task Watchdog (TWDT).
+
+By acquiring the SPI bus permanently (`spi_device_acquire_bus`) and utilizing the `mcp4922_ll_write_channels` function, the execution time is reduced to < 4us. This leaves ~70us of free CPU time for heavy floating-point control logic (PI/PID) while completely neutralizing Watchdog crashes.
+
+---
+![SmartSensing.me Logo](https://smartsensing.me/ssme-logo.png)
+
+## 📝 Description
+
+This project is part of the **SmartSensing.me** ecosystem and goes beyond basic examples found on the internet. Here, we apply the real fundamentals of high-performance instrumentation and embedded systems engineering.
+
+Unlike superficial content aimed only at clicks, this repository delivers:
+- **Originality:** Original implementations based on nearly 30 years of academic experience.
+- **Technical Density:** Professional use of the ESP-IDF framework and FreeRTOS.
+- **Didactics:** Documented and structured code for those seeking real technical evolution.
+
+> "We transform signals from the physical world into digital intelligence, without shortcuts."
 
 ---
 
-## 2. Especificação do Componente (`esp_mcp4922`)
-
-O componente deve abstrair o controle de múltiplos chips MCP4922 no mesmo barramento SPI. Cada chip possui 2 canais (A e B). O usuário informará a quantidade de **chips**, e o componente gerenciará a quantidade de **canais** internamente (num_canais = num_chips * 2).
-
-### 2.1. Estruturas de Dados
-Crie um `struct` de configuração (`mcp4922_config_t`) que receba:
-- Host SPI (ex: `SPI2_HOST`).
-- Pinos: MOSI, SCK, LDAC.
-- Número de chips (`num_chips`).
-- Um ponteiro para um array de pinos CS (`gpio_num_t *cs_pins`), onde o tamanho é igual a `num_chips`.
-- Configuração global de ganho (1x ou 2x) e VREF buffer.
-
-Crie um `struct` de contexto (`mcp4922_context_t`) que será retornado/preenchido pelo inicializador, contendo as *handles* dos dispositivos SPI registrados.
-
-### 2.2. API Requerida
-A biblioteca deve fornecer 3 funções principais:
-
-1. **`esp_err_t mcp4922_init(...)`**
-   - Configura o barramento SPI (Modo 0, MSB first, até 20MHz).
-   - Registra um *device* no barramento para cada pino CS fornecido.
-   - Configura o pino LDAC como saída GPIO comum.
-
-2. **`esp_err_t mcp4922_write_channels(mcp4922_context_t *ctx, uint16_t *channel_values)`**
-   - Função para uso em **Task normal** (Flash/FreeRTOS).
-   - Usa `spi_device_transmit` (bloqueante, com semáforo).
-   - Monta o *frame* de 16 bits (4 bits de config + 12 bits de dados) on-the-fly.
-   - Itera sobre os canais: índice par = Canal A, índice ímpar = Canal B. A cada 2 canais, avança para a próxima *handle* (próximo CS).
-   - Ao final do loop, gera um pulso (LOW -> HIGH) no pino LDAC.
-
-3. **`void IRAM_ATTR mcp4922_write_channels_isr(mcp4922_context_t *ctx, uint16_t *channel_values)`**
-   - Função para uso **EXCLUSIVO em Interrupções de Hardware**.
-   - MUST USE `IRAM_ATTR` na declaração e implementação.
-   - Usa exclusivamente `spi_device_polling_transmit` (sem semáforos, sem bloqueio de kernel).
-   - Mesma lógica de iteração e pulso LDAC da função acima, mas otimizada para velocidade extrema.
+## 🛠️ Technologies
+- **Hardware Target:** ESP32 / ESP32-S3
+- **Framework:** ESP-IDF v5.x
+- **Language:** C / C++
+- **Simulation:** LTSpice (Sensor Modeling)
 
 ---
 
-## 3. Especificação do Exemplo (`main.c`)
+## 👤 About the Author
 
-O exemplo deve demonstrar a capacidade de tempo real do ESP32-S3 e do componente. O objetivo é gerar **3 senoides de 60 Hz, defasadas em 90 graus**, utilizando 2 chips MCP4922 (ou seja, 4 canais disponíveis, usaremos apenas os índices 0, 1 e 2 do array).
+**José Alexandre de França** *Adjunct Professor at the Electrical Engineering Department of UEL*
 
-### 3.1. Requisitos do Sistema
-- **Microcontrolador:** ESP32-S3.
-- **Pinos para o Exemplo:** MOSI = 11, SCK = 12, CS1 = 10, CS2 = 9, LDAC = 14.
-- **Frequência de Atualização:** 13.500 Hz (13.5 kHz).
-- **Look-Up Table (LUT):** Crie um array estático (`IRAM_ATTR`) de 225 posições (`uint16_t`). 
-  - *Cálculo:* 13500 Hz / 60 Hz = 225 pontos por ciclo.
-  - A função `app_main` deve calcular a senoide (de 0 a 4095, centrada em 2048) e popular esse array antes de iniciar o timer.
+Electrical Engineer with nearly three decades of experience in undergraduate and graduate teaching. PhD in Electrical Engineering, researcher in electronic instrumentation and embedded systems developer. SmartSensing.me is my commitment to raising the level of technological education in Brazil.
 
-### 3.2. Configuração do Timer (GPTimer)
-- Configure um General Purpose Timer (GPTimer) para disparar um alarme a cada **~74.07 microssegundos** (frequência de 13.5 kHz).
-- **CRÍTICO:** A interrupção (ISR) do timer **DEVE** ser alocada obrigatoriamente no **CORE 1** do ESP32-S3 (use flags de alocação de interrupção ou crie a task de inicialização do timer pinada no Core 1). Isso evita conflitos com o rádio Wi-Fi no Core 0.
-
-### 3.3. Rotina de Interrupção (ISR)
-- A callback do timer (`IRAM_ATTR`) manterá um contador estático `idx` (de 0 a 224).
-- Deve criar um array local `uint16_t val[4]`.
-- Mapeamento das Fases (90 graus de defasagem = 1/4 do ciclo de 225 = ~56 índices de offset):
-  - `val[0] = lut[idx];` (Seno 1 - 0º)
-  - `val[1] = lut[(idx + 56) % 225];` (Seno 2 - 90º)
-  - `val[2] = lut[(idx + 112) % 225];` (Seno 3 - 180º)
-  - `val[3] = 0;` (Canal não utilizado)
-- Chamar `mcp4922_write_channels_isr(&ctx, val);`.
-- Incrementar `idx` (com wrap-around em 225).
+- 🌐 **Website:** [smartsensing.me](https://smartsensing.me)
+- 📧 **E-mail:** [info@smartsensing.me](mailto:info@smartsensing.me)
+- 📺 **YouTube:** [@smartsensingme](https://youtube.com/@smartsensingme)
+- 📸 **Instagram:** [@smartsensing.me](https://instagram.com/smartsensing.me)
 
 ---
-**Nota para a IA:** Gere o código completo e os arquivos `CMakeLists.txt` compatíveis com o build system do ESP-IDF. Documente o código C com clareza.
+
+## 📄 License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
